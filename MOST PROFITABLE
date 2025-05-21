@@ -1,0 +1,156 @@
+import numpy as np
+import os
+from datetime import datetime, timedelta
+
+# Strategy Parameters
+TRIGGER_GAIN = 0.0025
+TRAILING_STOP_MULTIPLIER = 2.5
+MIN_HOLD_MINUTES = 5
+MAX_POSITIONS = 3
+POSITION_SIZE_USD = 100
+MAX_TRADES_PER_DAY = 30
+MAX_DAILY_LOSS = -24
+SWITCH_THRESHOLD = 0.01
+INITIAL_CASH = 1000
+VOLATILITY_THRESHOLD = 0.0005
+COOLDOWN_MINUTES = 10
+FEE_RATE = 0.0004
+SLIPPAGE_RATE = 0.0003
+
+# Priority lock window and decay modifiers
+PRIORITY_HOURS = (5, 11)  # Chicago early momentum window
+RESET_SCORE_AFTER_EXIT = True
+CONFIDENCE_DECAY = 0.97  # Slower decay
+
+base_path = "backtest_data_30d"
+all_data = {}
+for f in os.listdir(base_path):
+    if f.endswith(".csv"):
+        symbol = f.split('_')[0]
+        df = pd.read_csv(os.path.join(base_path, f))
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df.set_index('timestamp', inplace=True)
+        if 'quote_volume' not in df.columns and 'volume' in df.columns:
+            df.rename(columns={'volume': 'quote_volume'}, inplace=True)
+        df = df[['open', 'high', 'low', 'close']]
+        all_data[symbol] = df
+
+combined = pd.concat(all_data.values(), keys=all_data.keys(), axis=1)
+timestamps = combined.index
+
+cash = INITIAL_CASH
+positions = {}
+last_exit_times = {}
+daily_pnl = 0
+total_fees = 0
+gross_pnl = 0
+trade_count = 0
+confidence_score = {}
+high_score_symbols = set()
+trade_log = []
+
+for ts in timestamps[60:]:
+    current_data = combined.loc[ts]
+    past_data = combined.loc[ts - pd.Timedelta(minutes=60)]
+
+    gains, volatilities = {}, {}
+    for symbol in all_data:
+        try:
+            now = current_data[(symbol, 'close')]
+            past = past_data[(symbol, 'close')]
+            recent = combined.loc[ts - pd.Timedelta(minutes=10):ts, (symbol, 'close')].dropna()
+
+            if pd.notna(now) and pd.notna(past) and past != 0:
+                short_term_gain = (now - past) / past
+                recent_gain = recent.pct_change().dropna().sum()
+                gains[symbol] = short_term_gain
+                volatilities[symbol] = recent.std() / now if len(recent) >= 5 else 0
+                confidence_score[symbol] = confidence_score.get(symbol, 0) * CONFIDENCE_DECAY + recent_gain
+            else:
+                gains[symbol] = -np.inf
+        except:
+            gains[symbol] = -np.inf
+
+    # Track top symbols
+    top_symbols = sorted(gains.items(), key=lambda x: x[1], reverse=True)[:3]
+    top_symbols = {s[0] for s in top_symbols if s[1] > 0}
+    high_score_symbols |= top_symbols
+
+    # Exit logic with adaptive trailing stop for top performers
+    for symbol in list(positions.keys()):
+        pos = positions[symbol]
+        price = current_data[(symbol, 'close')]
+        if pd.isna(price): continue
+        pos['highest_price'] = max(pos['highest_price'], price)
+        trailing_stop = pos['highest_price'] * (1 - (TRAILING_STOP_MULTIPLIER / (2 if symbol in high_score_symbols else 1)))
+        if price < trailing_stop:
+            size = pos['size']
+            value = size * price
+            fee = value * FEE_RATE
+            slippage = value * SLIPPAGE_RATE
+            profit = (price - pos['entry_price']) * size - slippage
+            cash += value - fee
+            gross_pnl += profit
+            daily_pnl += profit - 2 * fee
+            total_fees += fee
+            trade_log.append([ts, symbol, "SELL", price, profit, fee])
+            del positions[symbol]
+            last_exit_times[symbol] = ts
+            if RESET_SCORE_AFTER_EXIT and symbol in confidence_score:
+                confidence_score[symbol] = 0
+
+    if trade_count >= MAX_TRADES_PER_DAY or daily_pnl <= MAX_DAILY_LOSS:
+        break
+
+    valid = [
+        (s, g) for s, g in gains.items()
+        if g > TRIGGER_GAIN
+        and volatilities[s] > VOLATILITY_THRESHOLD
+        and (s not in positions)
+    ]
+    if not valid:
+        continue
+
+    valid.sort(key=lambda x: confidence_score.get(x[0], 0), reverse=True)
+
+    for symbol, gain in valid:
+        if symbol in positions or cash < POSITION_SIZE_USD:
+            continue
+        price = current_data[(symbol, 'close')]
+        size = POSITION_SIZE_USD / price
+        fee = POSITION_SIZE_USD * FEE_RATE
+        cash -= POSITION_SIZE_USD + fee
+        total_fees += fee
+        positions[symbol] = {
+            'entry_price': price,
+            'entry_time': ts,
+            'highest_price': price,
+            'size': size
+        }
+        trade_log.append([ts, symbol, "BUY", price, 0.0, fee])
+        trade_count += 1
+
+# Finalize
+for symbol in list(positions.keys()):
+    pos = positions[symbol]
+    price = combined.loc[ts, (symbol, 'close')]
+    size = pos['size']
+    value = size * price
+    fee = value * FEE_RATE
+    slippage = value * SLIPPAGE_RATE
+    profit = (price - pos['entry_price']) * size - slippage
+    cash += value - fee
+    gross_pnl += profit
+    total_fees += fee
+    trade_log.append([ts, symbol, "FINAL_CLOSE", price, profit, fee])
+
+print("\nFinal Stats:")
+print(f"Total Gross PnL: {gross_pnl:.2f}")
+print(f"Total Fees: {total_fees:.2f}")
+print(f"Net PnL: {gross_pnl - total_fees:.2f}")
+print(f"Remaining Cash: {cash:.2f}")
+print(f"Total Trades: {trade_count}")
+
+log_df = pd.DataFrame(trade_log, columns=["timestamp", "symbol", "action", "price", "pnl", "fee"])
+log_df.to_csv("trade_log_summary.csv", index=False)
+print("Trade log saved to trade_log_summary.csv")
